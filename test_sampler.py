@@ -52,7 +52,7 @@ def randn_tensor_like(x: torch.Tensor, generator: Optional[torch.Generator] = No
     shape = x.shape
     generator = generator
     device = x.device
-    dtype=x.dtype
+    dtype = x.dtype
     return randn_tensor(shape, generator, device, dtype)
 
 
@@ -84,58 +84,104 @@ class DummyModel:
         self,
         img_resolution=8,
         img_channels=3,
+        label_dim=0,
+        use_fp16=False,
         sigma_min=0.002,
         sigma_max=80.0,
         sigma_data=0.5,
     ):
         self.img_resolution = img_resolution
         self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.use_fp16 = use_fp16
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.model = dummy_model()
 
     def __call__(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
-        return self.model(x, sigma)
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.log() / 4
+
+        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        assert F_x.dtype == dtype
+        D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        return D_x
     
     def round_sigma(self, sigma):
         return torch.as_tensor(sigma)
 
 
 def edm_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
-    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    net,
+    latents,
+    class_labels=None,
+    randn_like=torch.randn_like,
+    num_steps=18,
+    sigma_min=0.002,
+    sigma_max=80,
+    rho=7,
+    S_churn=0,
+    S_min=0,
+    S_max=float('inf'),
+    S_noise=1,
+    dtype=torch.float64,
 ):
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
 
     # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    step_indices = torch.arange(num_steps, dtype=dtype, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
 
+    # print(f"Init noise sigma: {t_steps[0]}")
+    # print(f"Sigma Schedule: {t_steps}")
+
     # Main sampling loop.
-    x_next = latents.to(torch.float64) * t_steps[0]
+    # timesteps = []
+    x_next = latents.to(dtype) * t_steps[0]
+    # print(f"Initial scaled sample: {x_next}")
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         x_cur = x_next
 
         # Increase noise temporarily.
         gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
         t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+        # print(f"sigma at step {i}: {t_cur}")
+        # print(f"gamma at step {i}: {gamma}")
+        # print(f"sigma_hat at step {i}: {t_hat}")
+        # print(f"sigma_next at step {i}: {t_next}")
+        # timesteps.append(t_hat)
+        # timesteps.append(t_next)
+        if gamma > 0:
+            noise = S_noise * randn_like(x_cur)
+            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * noise
+            # x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+        else:
+            x_hat = x_cur
 
         # Euler step.
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+        denoised = net(x_hat, t_hat, class_labels).to(dtype)
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            denoised = net(x_next, t_next, class_labels).to(dtype)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+    
+    # print(f"Timestep schedule: {[0.25 * torch.log(t).item() for t in timesteps[:-1]]}")
+    # print(f"Timestep schedule length: {len(timesteps)}")
 
     return x_next
 
@@ -153,6 +199,15 @@ def main(args):
     generator = torch.manual_seed(args.seed)
     randn_like_fn = functools.partial(randn_tensor_like, generator=generator)
 
+    if args.precision == "single":
+        dtype = torch.float32
+    elif args.precision == "double":
+        dtype = torch.float64
+    elif args.precision == "half":
+        dtype = torch.float16
+    else:
+        raise ValueError(f"Precision type {args.precision} is not supported.")
+
     images = edm_sampler(
         net=model,
         latents=sample,
@@ -161,6 +216,7 @@ def main(args):
         num_steps=args.num_steps,
         sigma_min=args.sigma_min,
         sigma_max=args.sigma_max,
+        dtype=dtype,
     )
 
     expected_sum = torch.sum(torch.abs(images))
@@ -182,6 +238,7 @@ if __name__ == '__main__':
     parser.add_argument("--sigma_data", type=float, default=0.5)
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--precision", type=str, default="single")
 
     args = parser.parse_args()
 

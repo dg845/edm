@@ -119,6 +119,15 @@ class DummyModel:
         return torch.as_tensor(sigma)
 
 
+def get_karras_sigmas(num_steps, sigma_min, sigma_max, rho):
+    ramp = np.linspace(0, 1, num_steps)
+
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    return sigmas
+
+
 def edm_sampler(
     net,
     latents,
@@ -139,8 +148,9 @@ def edm_sampler(
     sigma_max = min(sigma_max, net.sigma_max)
 
     # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=dtype, device=latents.device)
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = t_steps.to(dtype=dtype)
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
 
     # print(f"Init noise sigma: {t_steps[0]}")
@@ -166,19 +176,32 @@ def edm_sampler(
             noise = S_noise * randn_like(x_cur)
             x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * noise
             # x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+            # if i == 0:
+            #     print(f"Noise at step {i}: {noise}")
+            #     print(f"Sample hat at step {i}: {x_hat}")
         else:
             x_hat = x_cur
 
         # Euler step.
         denoised = net(x_hat, t_hat, class_labels).to(dtype)
+        # if i == 0:
+        #     print(f"Denoised output for Euler step at step {i}: {denoised}")
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
+
+        # if i == 0:
+        #     print(f"Euler step sample at step {i}: {x_next}")
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
             denoised = net(x_next, t_next, class_labels).to(dtype)
+            # if i == 0:
+            #     print(f"Denoised output for Heun step at step {i}: {denoised}")
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+        # if i == 0:
+        #     print(f"Previous sample at step {i}: {x_next}")
     
     # print(f"Timestep schedule: {[0.25 * torch.log(t).item() for t in timesteps[:-1]]}")
     # print(f"Timestep schedule length: {len(timesteps)}")
@@ -216,6 +239,10 @@ def main(args):
         num_steps=args.num_steps,
         sigma_min=args.sigma_min,
         sigma_max=args.sigma_max,
+        S_churn=args.s_churn,
+        S_min=args.s_min,
+        S_max=args.s_max,
+        S_noise=args.s_noise,
         dtype=dtype,
     )
 
@@ -237,10 +264,13 @@ if __name__ == '__main__':
     parser.add_argument("--sigma_max", type=float, default=80.0)
     parser.add_argument("--sigma_data", type=float, default=0.5)
     parser.add_argument("--num_steps", type=int, default=10)
+    parser.add_argument("--s_churn", type=float, default=0.0)
+    parser.add_argument("--s_min", type=float, default=0.0)
+    parser.add_argument("--s_max", type=float, default=float('inf'))
+    parser.add_argument("--s_noise", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", type=str, default="single")
 
     args = parser.parse_args()
-
 
     main(args)
